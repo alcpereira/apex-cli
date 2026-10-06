@@ -229,9 +229,10 @@ Apex CLI will not break what you already have.
 How that works underneath:
 
 - Previews print paths and key/value changes, never secrets.
-- All selected configurations are parsed before any write. Malformed files and symlinked files or
-  directories are refused, and one bad assistant blocks the
-  whole batch instead of half-applying it.
+- All selected configurations are parsed before any write. Malformed files, symlinked files and
+  dangling links are refused, and one bad assistant blocks the whole batch instead of half-applying
+  it. Symlinked directories, such as Stow-managed dotfiles, are followed; the `.apex-backup-*` copies
+  then land in your dotfiles repo, so add `*.apex-backup-*` to its `.gitignore`.
 - The dedicated Codex Apex profile's owned keys are upgraded rather than rejected as conflicts;
   the base `config.toml` and other profiles remain untouched.
 - JSON/JSONC edits preserve comments and unrelated keys. The Callstack endpoint is set to the
