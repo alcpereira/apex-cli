@@ -29,6 +29,9 @@ npm run check     # syntax checks, build
 npm pack --dry-run
 ```
 
+CI runs `npm run check` and `npm test` on every pull request and push to `main`, on Linux with
+the latest Node.js (`.github/workflows/ci.yml`).
+
 Tests create a temporary `HOME`, fake credentials and a temporary state directory, so they never
 touch your assistants' settings. One test asserts the published bundle imports nothing but `node:*`,
 which is the point of bundling: `tsdown` inlines `@clack/prompts`, `jsonc-parser` and `smol-toml`
