@@ -1,20 +1,26 @@
-import { lstat, readFile, mkdir, open, rename, unlink } from 'node:fs/promises';
+import { lstat, stat, readFile, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { dirname, resolve, parse as parsePath, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { parse, modify, applyEdits } from 'jsonc-parser';
 import { parse as parseToml, stringify } from 'smol-toml';
 
+// Linked directories (Stow, dotfiles repos) are followed: writes land inside them and the link
+// survives. A linked file is refused, since renaming over it would replace the link, and so is a
+// dangling link on the way, which would only fail after other files were already written.
 async function assertSafePath(path) {
-  let current = parsePath(resolve(path)).root;
-  for (const part of resolve(path).slice(current.length).split(/[\\/]/).filter(Boolean)) {
+  const full = resolve(path);
+  let current = parsePath(full).root;
+  for (const part of full.slice(current.length).split(/[\\/]/).filter(Boolean)) {
     current = join(current, part);
-    try {
-      const info = await lstat(current);
-      if (info.isSymbolicLink()) throw new Error(`Refusing symbolic link: ${current}`);
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
+    let info;
+    try { info = await lstat(current); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    if (!info.isSymbolicLink()) continue;
+    if (current === full) throw new Error(`Refusing symbolic link: ${current}`);
+    await stat(current).catch(error => {
+      throw error.code === 'ENOENT' ? new Error(`Refusing dangling symbolic link: ${current}`) : error;
+    });
   }
 }
 
@@ -202,7 +208,7 @@ export async function removeChange(change) {
 
 export async function writeChange(change) {
   const { path, before, after } = change;
-  // readConfig refuses symbolic links anywhere on the path, so this check also guards the write.
+  // readConfig refuses a symlinked file or a dangling link, so this check also guards the write.
   if (await readConfig(path) !== before) throw new Error(`Configuration changed while planning: ${path}. Run init again.`);
   const backup = before === null ? null : `${path}.apex-backup-${randomUUID().slice(0, 8)}`;
   if (backup) {

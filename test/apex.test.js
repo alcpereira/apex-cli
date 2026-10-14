@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, writeFile, readFile, readdir, stat, symlink, realpath, rm, access } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, writeFile, readFile, readdir, stat, lstat, symlink, realpath, rm, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -426,15 +426,55 @@ test('private backups preserve original bytes and concurrent changes are refused
   assert.equal((await readdir(home)).filter(name => name.includes('apex-tmp')).length, 0);
 });
 
-test('symlink files and parent directories are refused', async context => {
+test('linked directories are read through, linked files and dangling links are refused', async context => {
   const { home } = await fixture(context);
-  const target = join(home, 'real');
-  await mkdir(target);
-  await writeFile(join(target, 'config'), '{}');
-  await symlink(target, join(home, 'linked'));
-  await symlink(join(target, 'config'), join(home, 'file-link'));
-  await assert.rejects(readConfig(join(home, 'linked', 'config')), /symbolic link/);
+  await mkdir(join(home, 'real'));
+  await writeFile(join(home, 'real', 'config'), '{}');
+  await symlink(join(home, 'real'), join(home, 'linked'));
+  await symlink(join(home, 'real', 'config'), join(home, 'file-link'));
+  await symlink(join(home, 'missing'), join(home, 'dangling'));
+  assert.equal(await readConfig(join(home, 'linked', 'config')), '{}');
   await assert.rejects(readConfig(join(home, 'file-link')), /symbolic link/);
+  await assert.rejects(readConfig(join(home, 'dangling', 'config')), /dangling symbolic link/);
+});
+
+test('Stow-linked config and state directories are followed and survive init and undo', async context => {
+  const { home, env } = await fixture(context);
+  // Stow folds each package into one directory link: ~/.config/opencode and ~/.local -> dotfiles.
+  delete env.APEX_STATE_DIR;
+  const real = join(home, 'dotfiles', 'opencode');
+  const linked = join(env.XDG_CONFIG_HOME, 'opencode');
+  await mkdir(real, { recursive: true });
+  await mkdir(join(home, 'dotfiles', 'local', 'share', 'opencode'), { recursive: true });
+  await mkdir(env.XDG_CONFIG_HOME, { recursive: true });
+  await writeFile(join(real, 'opencode.json'), OPENCODE);
+  await writeFile(join(home, 'dotfiles', 'local', 'share', 'opencode', 'auth.json'), JSON.stringify({ 'callstack.ai': { type: 'api', key: 'sk' } }));
+  await symlink(real, linked);
+  await symlink(join(home, 'dotfiles', 'local'), join(home, '.local'));
+  const init = ['init', '--assistants', 'opencode'];
+  const applied = cli([...init, '--apply'], env);
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.ok((await lstat(linked)).isSymbolicLink(), 'the directory link survives the write');
+  const written = parseJson(await readFile(join(real, 'opencode.json'), 'utf8'));
+  assert.equal(written.provider['callstack.ai'].options.apiKey, undefined, 'the key stored behind ~/.local is found');
+  assert.equal((await readdir(real)).filter(name => name.includes('apex-tmp')).length, 0);
+  assert.ok(await exists(join(home, 'dotfiles', 'local', 'state', 'apex', 'journal.json')));
+  const undone = cli(['undo', '--apply'], env);
+  assert.equal(undone.status, 0, undone.stderr);
+  assert.ok((await lstat(linked)).isSymbolicLink(), 'the directory link survives the undo');
+  assert.equal(await readFile(join(real, 'opencode.json'), 'utf8'), OPENCODE);
+});
+
+test('a dangling state directory link stops init before anything is written', async context => {
+  const { home, env } = await fixture(context);
+  delete env.APEX_STATE_DIR;
+  const path = await writeConfig(env, 'opencode', OPENCODE);
+  await symlink(join(home, 'missing'), join(home, '.local'));
+  const result = cli(['init', '--assistants', 'opencode', '--apply'], env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout + result.stderr, /dangling symbolic link/);
+  assert.equal(await readFile(path, 'utf8'), OPENCODE);
+  assert.deepEqual(await readdir(dirname(path)), ['opencode.json']);
 });
 
 test('launch config scopes Claude credentials without mutating parent environment', () => {
