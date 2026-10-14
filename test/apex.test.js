@@ -4,7 +4,7 @@ import { chmod, mkdtemp, mkdir, writeFile, readFile, readdir, stat, lstat, symli
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { detect, locations, planAssistant, launchOptions, MODEL } from '../src/assistants.js';
+import { PROVIDERS, defaultProvider, detect, locations, planAssistant, launchOptions, manualSteps } from '../src/assistants.js';
 import { addToml, updateToml, editJson, parseJson, parseToml, readConfig, sha256, writeChange } from '../src/config.js';
 import { diffValues, unifiedDiff } from '../src/diff.js';
 import { isSecretKey, redactText } from '../src/secrets.js';
@@ -12,6 +12,10 @@ import { journalPath, markUndone } from '../src/journal.js';
 import { wrap } from '../src/ui.js';
 
 const BIN = resolve('bin/apex.js');
+// The fixture only holds a Callstack key, so every run below defaults to the Callstack portal.
+const CALLSTACK = PROVIDERS.callstack;
+const VERCEL = PROVIDERS.vercel;
+const MODEL = CALLSTACK.model;
 
 // Everything Apex prints lives in a 3-space gutter that matches clack's own text column, so the
 // grid assertions ask for that column instead of hard-coding it a dozen times.
@@ -199,12 +203,12 @@ test('all automatic adapters configure and repeat without changing files', async
   const paths = locations(home, env);
   for (const id of ['codex', 'claude', 'opencode', 'pi']) {
     const assistant = { id, directory: paths[id] };
-    for (const change of await planAssistant(assistant)) {
+    for (const change of await planAssistant(assistant, CALLSTACK)) {
       await writeChange(change);
       assert.equal((await stat(change.path)).mode & 0o777, 0o600);
       assert.ok(!(await readFile(change.path, 'utf8')).includes(env.CALLSTACK_AUTH_TOKEN));
     }
-    const again = await planAssistant(assistant);
+    const again = await planAssistant(assistant, CALLSTACK);
     assert.ok(again.every(change => change.before === change.after), id);
   }
   const codex = parseToml(await readFile(join(paths.codex, 'callstack_ai.config.toml'), 'utf8'));
@@ -264,7 +268,7 @@ test('outdated OpenCode and Pi budgets and efforts upgrade while preserving cust
         [settings]: { reasoningEffort: 'minimal', custom: 3 }, variants: v2 ? [{ id: 'max' }] : { max: { reasoningEffort: 'max' } } },
     } } } };
     await writeConfig(env, 'opencode', JSON.stringify(old));
-    const [change] = await planAssistant({ id: 'opencode', directory });
+    const [change] = await planAssistant({ id: 'opencode', directory }, CALLSTACK);
     const provider = parseJson(change.after)[root]['callstack.ai'];
     assert.equal(provider.custom, true);
     assert.equal(provider[settings].custom, 1);
@@ -277,14 +281,14 @@ test('outdated OpenCode and Pi budgets and efforts upgrade while preserving cust
     assert.deepEqual(provider.models[MODEL].limit, { context: 262144, output: 32768 });
     assert.deepEqual(v2 ? provider.models[MODEL].variants.map(v => v.id) : Object.keys(provider.models[MODEL].variants), ['none', 'low', 'medium', 'xhigh']);
     await writeChange(change);
-    const [repeat] = await planAssistant({ id: 'opencode', directory });
+    const [repeat] = await planAssistant({ id: 'opencode', directory }, CALLSTACK);
     assert.equal(repeat.before, repeat.after);
   }
   const directory = locations(home, env).pi;
   await writeConfig(env, 'pi', JSON.stringify({ providers: { callstack: { apiKey: 'stored', models: [
     { id: MODEL, contextWindow: 262144, maxTokens: 131072, custom: true, compat: { supportsStore: false, reasoningEffortMap: { minimal: 'minimal' } } },
   ] } } }));
-  const [change] = await planAssistant({ id: 'pi', directory });
+  const [change] = await planAssistant({ id: 'pi', directory }, CALLSTACK);
   const provider = parseJson(change.after).providers.callstack;
   assert.equal(provider.apiKey, 'stored');
   assert.equal(provider.models[0].maxTokens, 32768);
@@ -335,7 +339,7 @@ test('Pi keeps other providers and models', async context => {
   await writeFile(join(directory, 'models.json'), JSON.stringify({ providers: {
     other: { models: [{ id: 'other' }] }, callstack: { models: [{ id: 'legacy' }, { id: MODEL }, { id: 'later' }] },
   } }));
-  const [change] = await planAssistant({ id: 'pi', directory });
+  const [change] = await planAssistant({ id: 'pi', directory }, CALLSTACK);
   const value = parseJson(change.after);
   assert.equal(value.providers.other.models[0].id, 'other');
   // An Apex entry from an earlier setup is upgraded in place, next to models it does not own.
@@ -379,15 +383,15 @@ test('upgrading from 0.2 keeps the keys it stored, so nobody is left sending no 
   await writeFile(authFile, JSON.stringify({ 'callstack.ai': { type: 'api', key: 'sk-stored-by-0.2' } }));
   await mkdir(paths.opencode, { recursive: true });
   await writeFile(join(paths.opencode, 'opencode.json'), JSON.stringify({ provider: { 'callstack.ai': { options: { baseURL: 'https://api.callstack.ai/v1' } } } }));
-  const [opencode] = await planAssistant({ id: 'opencode', directory: paths.opencode, authFile });
+  const [opencode] = await planAssistant({ id: 'opencode', directory: paths.opencode, authFile }, CALLSTACK);
   assert.equal(parseJson(opencode.after).provider['callstack.ai'].options.apiKey, undefined);
   // Without a stored key, the config references the environment as before.
-  const [fresh] = await planAssistant({ id: 'opencode', directory: paths.opencode, authFile: join(home, 'none.json') });
+  const [fresh] = await planAssistant({ id: 'opencode', directory: paths.opencode, authFile: join(home, 'none.json') }, CALLSTACK);
   assert.equal(parseJson(fresh.after).provider['callstack.ai'].options.apiKey, '{env:CALLSTACK_AUTH_TOKEN}');
 
   await mkdir(paths.pi, { recursive: true });
   const pi = key => writeFile(join(paths.pi, 'models.json'), JSON.stringify({ providers: { callstack: { apiKey: key, models: [{ id: MODEL }] } } }));
-  const piKey = async () => parseJson((await planAssistant({ id: 'pi', directory: paths.pi }))[0].after).providers.callstack.apiKey;
+  const piKey = async () => parseJson((await planAssistant({ id: 'pi', directory: paths.pi }, CALLSTACK))[0].after).providers.callstack.apiKey;
   await pi('sk-stored-by-0.2');
   assert.equal(await piKey(), 'sk-stored-by-0.2');
   await pi('XXX');
@@ -399,18 +403,18 @@ test('OpenCode JSONC is edited in place, v2 config gets the v2 shape, ambiguous 
   const directory = locations(home, env).opencode;
   await mkdir(directory, { recursive: true });
   await writeFile(join(directory, 'opencode.jsonc'), '{ // preserved\n "theme": "dark"\n}');
-  const [change] = await planAssistant({ id: 'opencode', directory });
+  const [change] = await planAssistant({ id: 'opencode', directory }, CALLSTACK);
   assert.match(change.path, /\.jsonc$/);
   assert.match(change.after, /preserved/);
   await writeFile(join(directory, 'opencode.jsonc'), '{"providers": {"other": {}}}');
-  const [v2] = await planAssistant({ id: 'opencode', directory });
+  const [v2] = await planAssistant({ id: 'opencode', directory }, CALLSTACK);
   const providers = parseJson(v2.after).providers;
   assert.deepEqual(Object.keys(providers), ['other', 'callstack.ai']);
   assert.equal(providers['callstack.ai'].models[MODEL].capabilities.tools, true);
   assert.ok(!('provider' in parseJson(v2.after)), 'no v1 block next to a v2 config');
   assert.match(v2.steps[0], /\/connect/);
   await writeFile(join(directory, 'opencode.json'), '{}');
-  await assert.rejects(planAssistant({ id: 'opencode', directory }), /Both/);
+  await assert.rejects(planAssistant({ id: 'opencode', directory }, CALLSTACK), /Both/);
 });
 
 test('private backups preserve original bytes and concurrent changes are refused', async context => {
@@ -498,7 +502,92 @@ test('launch config scopes Claude credentials without mutating parent environmen
   assert.equal(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, '131072');
   assert.deepEqual(launchOptions('codex', env).args, ['--profile', 'callstack_ai']);
   assert.deepEqual(launchOptions('opencode', env).args, ['--model', 'callstack.ai/callstack/Apex']);
-  assert.throws(() => launchOptions('pi', {}), /CALLSTACK_AUTH_TOKEN/);
+  assert.throws(() => launchOptions('pi', {}), /AI_GATEWAY_API_KEY/, 'no key at all means Vercel AI Gateway');
+  assert.throws(() => launchOptions('pi', {}, CALLSTACK), /CALLSTACK_AUTH_TOKEN/);
+});
+
+test('the gateway defaults to whichever key is set, and Vercel AI Gateway otherwise', () => {
+  assert.equal(defaultProvider({}), VERCEL);
+  assert.equal(defaultProvider({ CALLSTACK_AUTH_TOKEN: 'x' }), CALLSTACK);
+  assert.equal(defaultProvider({ CALLSTACK_AUTH_TOKEN: ' ' }), VERCEL, 'a blank key is no key');
+  assert.equal(defaultProvider({ AI_GATEWAY_API_KEY: 'x' }), VERCEL);
+  assert.equal(defaultProvider({ AI_GATEWAY_API_KEY: 'x', CALLSTACK_AUTH_TOKEN: 'y' }), VERCEL);
+});
+
+test('Vercel AI Gateway adapters use its model id, key and per-agent endpoints', async context => {
+  const { home, env } = await fixture(context);
+  const paths = locations(home, env);
+  for (const id of ['codex', 'opencode', 'pi']) {
+    for (const change of await planAssistant({ id, directory: paths[id] }, VERCEL)) await writeChange(change);
+  }
+  const codex = parseToml(await readFile(join(paths.codex, 'apex_vercel.config.toml'), 'utf8'));
+  assert.equal(codex.model, 'callstack/apex');
+  assert.deepEqual(codex.model_providers.apex_vercel, { name: 'Vercel AI Gateway',
+    base_url: 'https://ai-gateway.vercel.sh/codex/v1', env_key: 'AI_GATEWAY_API_KEY',
+    wire_api: 'responses', requires_openai_auth: false });
+  const pi = parseJson(await readFile(join(paths.pi, 'models.json'), 'utf8'));
+  assert.equal(pi.providers['apex-vercel'].apiKey, '$AI_GATEWAY_API_KEY');
+  assert.equal(pi.providers['apex-vercel'].baseUrl, 'https://ai-gateway.vercel.sh/coding-agent/v1');
+  assert.equal(pi.providers['apex-vercel'].models[0].contextWindow, 262144);
+  const piSettings = parseJson(await readFile(join(paths.pi, 'settings.json'), 'utf8'));
+  assert.equal(piSettings.modelThinkingLevels['apex-vercel/callstack/apex'], 'medium');
+  // Switching gateways adds a provider next to the old one instead of rewriting it.
+  for (const change of await planAssistant({ id: 'opencode', directory: paths.opencode }, CALLSTACK)) await writeChange(change);
+  const opencode = parseJson(await readFile(join(paths.opencode, 'opencode.json'), 'utf8'));
+  assert.equal(opencode.provider['apex-vercel'].options.apiKey, '{env:AI_GATEWAY_API_KEY}');
+  assert.deepEqual(Object.keys(opencode.provider['apex-vercel'].models), ['callstack/apex']);
+  assert.equal(opencode.provider['callstack.ai'].options.apiKey, '{env:CALLSTACK_AUTH_TOKEN}');
+
+  const claude = launchOptions('claude', { AI_GATEWAY_API_KEY: 'gw', ANTHROPIC_API_KEY: 'old' });
+  assert.equal(claude.env.ANTHROPIC_BASE_URL, 'https://ai-gateway.vercel.sh/claude-code');
+  assert.equal(claude.env.ANTHROPIC_AUTH_TOKEN, 'gw');
+  assert.equal(claude.env.ANTHROPIC_API_KEY, undefined);
+  assert.deepEqual(claude.args, ['--model', 'callstack/apex']);
+  assert.deepEqual(launchOptions('opencode', { AI_GATEWAY_API_KEY: 'gw' }).args, ['--model', 'apex-vercel/callstack/apex']);
+  assert.deepEqual(launchOptions('pi', { AI_GATEWAY_API_KEY: 'gw' }).args,
+    ['--provider', 'apex-vercel', '--model', 'callstack/apex', '--thinking', 'medium']);
+
+  // OpenCode 2 gets the gateway as its own provider, and the key step names it.
+  const directory = join(home, 'opencode-v2');
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, 'opencode.json'), '{"providers": {}}');
+  const [v2] = await planAssistant({ id: 'opencode', directory }, VERCEL);
+  const vercel = parseJson(v2.after).providers['apex-vercel'];
+  assert.equal(vercel.settings.baseURL, 'https://ai-gateway.vercel.sh/coding-agent/v1');
+  assert.deepEqual(vercel.models['callstack/apex'].limit, { context: 262144, output: 32768 });
+  assert.match(v2.steps[0], /pick Vercel AI Gateway .*Vercel AI Gateway API key/);
+
+  // An app is not a coding agent, so the AI SDK snippet uses the general endpoint.
+  const sdk = manualSteps('ai-sdk', VERCEL).join('\n');
+  assert.match(sdk, /baseURL: 'https:\/\/ai-gateway\.vercel\.sh\/v1'/);
+  assert.match(sdk, /process\.env\.AI_GATEWAY_API_KEY/);
+  assert.match(sdk, /apex\('callstack\/apex'\)/);
+  assert.match(manualSteps('cursor', VERCEL)[0], /https:\/\/ai-gateway\.vercel\.sh\/cursor\/v1/);
+});
+
+test('--provider picks the gateway for init and run, and rejects unknown ones', async context => {
+  const { home, env } = await fixture(context);
+  await seedHome(env);
+  const plan = JSON.parse(cli([...INIT, '--provider', 'vercel', '--json'], env).stdout);
+  assert.equal(plan.provider, 'vercel');
+  assert.equal(plan.model, 'callstack/apex');
+  assert.equal(plan.envVar, 'AI_GATEWAY_API_KEY');
+  assert.equal(plan.endpoint, 'https://ai-gateway.vercel.sh/coding-agent/v1');
+  assert.equal(JSON.parse(cli([...INIT, '--json'], env).stdout).provider, 'callstack', 'the set key decides');
+  assert.equal(cli([...INIT, '--provider', 'openrouter'], env).status, 1);
+
+  const bin = join(home, 'bin');
+  await mkdir(bin);
+  await writeFile(join(bin, 'codex'), `#!${process.execPath}\nconsole.log(JSON.stringify(process.argv.slice(2)));\n`, { mode: 0o755 });
+  const run = args => cli(['run', ...args], { ...env, AI_GATEWAY_API_KEY: 'gw', PATH: bin });
+  const callstack = ['--profile', 'callstack_ai'];
+  const vercel = ['--profile', 'apex_vercel'];
+  assert.deepEqual(JSON.parse(run(['codex']).stdout), vercel, 'both keys set: Vercel AI Gateway');
+  assert.deepEqual(JSON.parse(run(['--provider', 'callstack', 'codex']).stdout), callstack);
+  assert.deepEqual(JSON.parse(run(['codex', '--provider=callstack', '--', 'x']).stdout), [...callstack, 'x']);
+  assert.deepEqual(JSON.parse(run(['codex', '--', '--provider', 'callstack']).stdout), [...vercel, '--provider', 'callstack'],
+    'after -- it belongs to the assistant');
+  assert.equal(run(['--provider', 'nope', 'codex']).status, 1);
 });
 
 test('CLI defaults to a preview: nothing is written without --apply', async context => {
@@ -569,7 +658,12 @@ test('human output keeps one indentation grid', async context => {
   assert.ok(row(/^Environment$/), 'section heading');
   assert.ok(row(/^\u2713 CALLSTACK_AUTH_TOKEN is set in this shell$/), 'section body');
   const unset = cli([...INIT, '--no-interactive', '--no-diff'], { ...env, CALLSTACK_AUTH_TOKEN: '' }).stdout;
-  assert.match(unset, at(/^export CALLSTACK_AUTH_TOKEN=<your callstack\.ai key>$/));
+  assert.match(unset, at(/^export AI_GATEWAY_API_KEY=<Vercel AI Gateway API key>$/), 'no key means Vercel');
+  assert.match(unset, at(/^Create a key at\n {3}https:\/\/vercel\.com\//), 'the key link stays whole');
+  assert.match(unset, / https:\/\/vercel\.com\/docs\/ai-gateway\/coding-agents$/m, 'Vercel links its own guide');
+  assert.ok(!/notion/.test(unset), 'the portal guide is not for Vercel users');
+  const portal = cli([...INIT, '--provider', 'callstack', '--no-interactive', '--no-diff'], { ...env, CALLSTACK_AUTH_TOKEN: '' }).stdout;
+  assert.match(portal, at(/^export CALLSTACK_AUTH_TOKEN=<callstack\.ai key>$/));
   assert.ok(!at(/^\u2713/).test(unset), unset);
   assert.ok(!lines.some(line => /^\S/.test(line)), `nothing may start at column 0: ${lines.find(l => /^\S/.test(l))}`);
 
@@ -586,7 +680,7 @@ test('the model id is highlighted green wherever it is shown', async context => 
   const result = cli([...INIT, '--no-interactive', '--no-diff'], color);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /\u001b\[32mcallstack\/Apex\u001b\[39m/);
-  assert.match(result.stdout, /Configure \u001b\[32mcallstack\/Apex\u001b\[39m for your favorite harness/);
+  assert.match(result.stdout, /run \u001b\[32mcallstack\/Apex\u001b\[39m with your selected harnesses/);
   // Highlighting must not break the padded columns.
   assert.match(result.stdout.replace(/\u001b\[[0-9;]*m/g, ''), at(/^[+~-] \S+ {2}\S/));
 });
@@ -750,7 +844,7 @@ test('CLI validates flags and commands', async context => {
 
 test('manual adapters never write editor credentials', async context => {
   const { home, env } = await fixture(context);
-  for (const id of ['cursor', 'copilot']) assert.deepEqual(await planAssistant({ id, directory: home }), []);
+  for (const id of ['cursor', 'copilot']) assert.deepEqual(await planAssistant({ id, directory: home }, CALLSTACK), []);
   const result = cli(['init', '--assistants', 'cursor,copilot', '--apply'], env);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Cursor: Settings/);
@@ -896,9 +990,8 @@ test('help is coloured, ordered and fits a narrow terminal', async context => {
   assert.match(help, /\u001b\[32mapex\u001b\[39m completion\u001b\[2m bash >> ~\/\.bashrc\u001b\[22m/);
   assert.match(help, /\u001b\[32mapex\u001b\[39m help +show all commands/, 'a bare command leaves no empty dim span');
   const wrapped = cli(['--help'], { ...env, NO_COLOR: '0', FORCE_COLOR: '1', COLUMNS: '44' }).stdout;
-  assert.match(wrapped, /^ {2}\u001b\[2m<args>\]\u001b\[22m$/m, 'a wrapped command continues dim');
+  assert.match(wrapped, /^ {2}\u001b\[2m<codex\|claude\|opencode\|pi> \[-- <args>\]\u001b\[22m$/m, 'a wrapped command continues dim');
   assert.match(help, /\u001b\[1m\u001b\[4mUsage/, 'sections are bold and underlined');
-  assert.match(help, /callstack\/Apex.*\u001b\[32m|\u001b\[32mcallstack\/Apex/, 'the model is green');
   // The promises belong in the README, and the safe default needs no flag to explain it.
   for (const gone of ['Safety:', 'Exit codes', '--dry-run', '--yes']) {
     assert.ok(!help.includes(gone), `help still mentions ${gone}`);
@@ -961,7 +1054,7 @@ test('completions offer each flag only for the commands that accept it', () => {
 
   const zsh = script('zsh');
   // Per-command arrays are declared as locals, so completing leaks nothing into the user's shell.
-  assert.match(zsh, /^ {2}local -a commands assistants runnable init_flags detect_flags undo_flags$/m);
+  assert.match(zsh, /^ {2}local -a commands assistants providers runnable init_flags detect_flags undo_flags$/m);
   const zshFlags = name => lineWith(zsh, `${name}_flags=`);
   assert.match(zshFlags('detect'), /--json/);
   assert.ok(!zshFlags('detect').includes('--assistants'), zshFlags('detect'));
