@@ -908,17 +908,22 @@ process.exit(0);
 process.stderr.write('Usage: opencode [flags]\\n  --model  model to use\\n');
 process.exit(0);
 `, { mode: 0o755 });
+  // What a wrapper printed before it died is still the answer; a failure that printed nothing is not.
+  await writeFile(join(bin, 'exit-3-flag'), `#!${process.execPath}\nprocess.stdout.write('  --standalone\\n');\nprocess.exit(3);\n`, { mode: 0o755 });
+  await writeFile(join(bin, 'exit-1-silent'), `#!${process.execPath}\nprocess.exit(1);\n`, { mode: 0o755 });
   const paths = name => join(bin, name);
   assert.equal(await openCodeSupportsStandalone(paths('help-stdout')), true, 'the flag on stdout');
   assert.equal(await openCodeSupportsStandalone(paths('help-stderr')), true, 'the flag on stderr, where OpenCode 1 writes');
   assert.equal(await openCodeSupportsStandalone(paths('v1-help')), false, 'a help page without the flag');
+  assert.equal(await openCodeSupportsStandalone(paths('exit-3-flag')), true, 'a failing --help that printed the flag still answers v2');
+  assert.equal(await openCodeSupportsStandalone(paths('exit-1-silent')), null, 'a failing --help that printed nothing is no answer');
   assert.equal(await openCodeSupportsStandalone(join(home, 'missing')), null, 'a binary that is not there');
   assert.equal(await openCodeSupportsStandalone(bin), null, 'a directory is not a binary');
-  // execFile can throw synchronously (an empty path; on Windows, any .cmd launcher since
-  // CVE-2024-27980). A probe that cannot ask must answer "no answer", not reject on the caller.
-  assert.equal(await openCodeSupportsStandalone(''), null, 'an empty path throws synchronously');
-  await writeFile(paths('exit-3'), `#!${process.execPath}\nprocess.stdout.write('  --standalone\\n');\nprocess.exit(3);\n`, { mode: 0o755 });
-  assert.equal(await openCodeSupportsStandalone(paths('exit-3')), null, 'a --help that fails is no answer');
+  // execFile rejects outright on some truthy paths (one with a NUL byte; on Windows, any .cmd
+  // launcher since CVE-2024-27980). A probe that cannot ask must answer "no answer", not reject on
+  // the caller. An empty or missing path answers the same way, from the guard that runs first.
+  assert.equal(await openCodeSupportsStandalone('a\0b'), null, 'a path execFile throws synchronously on');
+  assert.equal(await openCodeSupportsStandalone(''), null, 'no path, no answer');
   assert.equal(await openCodeSupportsStandalone(null), null, 'no binary, no answer');
 });
 
@@ -926,67 +931,49 @@ test('CLI run picks the model the way the installed OpenCode accepts it', async 
   const { home, env } = await fixture(context);
   const bin = join(home, 'bin');
   await mkdir(bin);
-  // The fake answers --help (the probe) and --version (never read by Apex CLI) from separate
-  // variables: which generation a build is must be assertible independently of the version string
-  // it prints, because dev and beta builds of both generations print 0.0.0-*.
+  // The fake answers the probe from one variable. Apex CLI never reads --version, so the fake
+  // has no --version branch at all: which generation a build is comes only from what --help prints.
   await writeFile(join(bin, 'opencode'), `#!${process.execPath}
 if (process.argv[2] === '--help') {
   if (process.env.FAKE_OPENCODE_HELP_FAILS === '1') process.exit(1);
-  const help = process.env.FAKE_OPENCODE_STANDALONE === '1'
+  process.stdout.write(process.env.FAKE_OPENCODE_STANDALONE === '1'
     ? '  --standalone  start a private server\\n  --print-logs  write logs to a file\\n'
-    : '  --model  model to use\\n  --print-logs  write logs to a file\\n';
-  (process.env.FAKE_OPENCODE_HELP_STREAM === 'stderr' ? process.stderr : process.stdout).write(help);
+    : '  --model  model to use\\n  --print-logs  write logs to a file\\n');
   process.exit(0);
 }
-if (process.argv[2] === '--version') { console.log(process.env.FAKE_OPENCODE_VERSION); process.exit(0); }
 console.log(JSON.stringify({ args: process.argv.slice(2), inline: process.env.OPENCODE_CONFIG_CONTENT }));
 `, { mode: 0o755 });
   const V2 = { FAKE_OPENCODE_STANDALONE: '1' };
   const V1 = { FAKE_OPENCODE_STANDALONE: '0' };
-  const run = (version, capability = {}, extra = {}, passed = ['--x']) => {
-    const result = cli(['run', 'opencode', '--', ...passed],
-      { ...env, PATH: bin, FAKE_OPENCODE_VERSION: version, ...capability, ...extra });
+  const run = (capability = {}, extra = {}, passed = ['--x']) => {
+    const result = cli(['run', 'opencode', '--', ...passed], { ...env, PATH: bin, ...capability, ...extra });
     assert.equal(result.status, 0, result.stderr);
     return JSON.parse(result.stdout);
   };
-  assert.deepEqual(run('1.18.34', V1), { args: ['--model', `callstack.ai/${MODEL}`, '--x'] });
-  assert.deepEqual(run('1.18.34', V1, {}, ['run', 'hi']).args, ['--model', `callstack.ai/${MODEL}`, 'run', 'hi']);
+  assert.deepEqual(run(V1), { args: ['--model', `callstack.ai/${MODEL}`, '--x'] });
+  assert.deepEqual(run(V1, {}, ['run', 'hi']).args, ['--model', `callstack.ai/${MODEL}`, 'run', 'hi']);
   // OpenCode 2's TUI rejects --model; a private server reads the model from inline config.
-  const v2 = run('opencode v2.0.29', V2, { OPENCODE_CONFIG_CONTENT: '{ // OpenCode reads JSONC here too\n"theme":"dark", }' });
+  const v2 = run(V2, { OPENCODE_CONFIG_CONTENT: '{ // OpenCode reads JSONC here too\n"theme":"dark", }' });
   assert.deepEqual(v2.args, ['--standalone', '--x']);
-  assert.deepEqual(run('2.0.29', V2, {}, ['run', 'hi']).args, ['run', '--standalone', 'hi'], 'v2 flags follow the subcommand');
-  assert.deepEqual(run('2.0.29', V2, {}, [home]).args, ['--standalone', home], 'a directory starts the interface');
-  assert.deepEqual(run('2.0.29', V2, {}, ['mini']).args, ['mini', '--standalone']);
-  assert.deepEqual(run('2.0.29', V2, {}, ['auth', 'list']).args, ['auth', 'list'], 'subcommands without --standalone pass through');
+  assert.deepEqual(run(V2, {}, ['run', 'hi']).args, ['run', '--standalone', 'hi'], 'v2 flags follow the subcommand');
+  assert.deepEqual(run(V2, {}, [home]).args, ['--standalone', home], 'a directory starts the interface');
+  assert.deepEqual(run(V2, {}, ['mini']).args, ['mini', '--standalone']);
+  assert.deepEqual(run(V2, {}, ['auth', 'list']).args, ['auth', 'list'], 'subcommands without --standalone pass through');
   assert.deepEqual(JSON.parse(v2.inline), { theme: 'dark', model: `callstack.ai/${MODEL}` });
-  // Every build of both generations that reports 0.0.0-* is decided by the flag it has, never by
-  // its version: these two differ only in what --help prints, and answer opposite ways.
-  assert.deepEqual(run('opencode v0.0.0-beta-19507', V2).args, ['--standalone', '--x'],
-    'a v2 beta reports 0.0.0-* and the version regex rejected --model on it');
-  assert.deepEqual(run('0.0.0-dev-202610141901', V1).args, ['--model', `callstack.ai/${MODEL}`, '--x'],
-    'a v1 dev build reports 0.0.0-* too, so major 0 does not mean OpenCode 2');
-  assert.deepEqual(run('opencode vlocal', V2).args, ['--standalone', '--x'], 'a source build');
-  assert.deepEqual(run('Update available: 2.1.0\n1.18.34', V2).args, ['--standalone', '--x'],
-    'what --version prints decides nothing');
-  // OpenCode 1 prints its help on stderr, so the probe reads both streams either way.
-  assert.deepEqual(run('opencode v2.0.29', { ...V2, FAKE_OPENCODE_HELP_STREAM: 'stderr' }).args,
-    ['--standalone', '--x'], '--standalone found on stderr');
-  assert.deepEqual(run('1.18.34', { ...V1, FAKE_OPENCODE_HELP_STREAM: 'stderr' }).args,
-    ['--model', `callstack.ai/${MODEL}`, '--x'], 'its absence on stderr too');
   // A binary that cannot be asked adds no flag rather than guessing a generation and dying on it.
-  const unknown = run('opencode v2.0.29', { FAKE_OPENCODE_HELP_FAILS: '1' });
+  const unknown = run({ FAKE_OPENCODE_HELP_FAILS: '1' });
   assert.deepEqual(unknown.args, ['--x'], 'an unanswerable probe launches with neither --model nor --standalone');
   assert.equal(unknown.inline, undefined, 'and the inline config is left alone');
   assert.match(cli(['run', 'opencode', '--', '--x'], { ...env, PATH: bin, FAKE_OPENCODE_HELP_FAILS: '1' }).stderr,
     /launches without a model flag/);
-  const broken = cli(['run', 'opencode'], { ...env, PATH: bin, ...V2, FAKE_OPENCODE_VERSION: '2.0.0', OPENCODE_CONFIG_CONTENT: '{' });
+  const broken = cli(['run', 'opencode'], { ...env, PATH: bin, ...V2, OPENCODE_CONFIG_CONTENT: '{' });
   assert.equal(broken.status, 1);
   assert.match(broken.stderr, /Invalid JSON\/JSONC object in OPENCODE_CONFIG_CONTENT/);
 
   assert.equal(runExpansion('opencode', CALLSTACK), `opencode --model callstack.ai/${MODEL}`);
   assert.equal(runExpansion('opencode', CALLSTACK, { openCodeStandalone: true }), 'opencode --standalone  (OPENCODE_CONFIG_CONTENT model set)');
   assert.equal(runExpansion('opencode', CALLSTACK, { openCodeStandalone: null }),
-    'opencode  (OpenCode version unknown: no model flag added)');
+    'opencode  (OpenCode interface unknown: no model flag added)');
 });
 
 test('closing the pipe early exits quietly instead of crashing', async context => {
@@ -1260,9 +1247,9 @@ test('the closing block shows what each run command expands to, and when undo is
   const applied = cli([...INIT, '--apply'], env);
   assert.equal(applied.status, 0, applied.stderr);
   assert.match(applied.stdout, at(/^Use these commands to run callstack\/Apex with your selected harnesses:$/));
-  // The fixture has no opencode on PATH, so the summary admits it cannot know which flag the
-  // launch will add instead of blindly showing the v1 one.
-  assert.match(applied.stdout, at(/^apex run opencode {2}opencode {2}\(OpenCode version unknown: no model flag added\)$/));
+  // The fixture has no opencode on PATH, so there is no interface to ask about and the line says
+  // just the command; `apex run opencode` itself is what reports the missing binary.
+  assert.match(applied.stdout, at(/^apex run opencode {2}opencode$/));
   assert.match(applied.stdout, at(/^apex run codex +codex --profile callstack_ai$/));
   assert.match(applied.stdout, at(/^apex run pi +pi --provider callstack --model callstack\/Apex --thinking medium$/));
   assert.match(applied.stdout, at(/^\.\.\.or pick "callstack\/Apex" from the UI when setting up manually\.$/));

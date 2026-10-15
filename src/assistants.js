@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { access, readFile, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { join, delimiter } from 'node:path';
@@ -97,27 +98,27 @@ export async function executable(command, env = process.env, platform = process.
   return null;
 }
 
+const execFileAsync = promisify(execFile);
+
 // OpenCode 2's interface has --standalone; OpenCode 1's never had it. Asking the binary which
 // interface it has beats reading its version: dev, beta and source builds of *both* generations
 // report `0.0.0-*` or `local`, so no version regex separates them. OpenCode 1 writes --help to
 // stderr and OpenCode 2 to stdout, so both streams are checked. The answer is true (OpenCode 2),
 // false (OpenCode 1) or null: no answer, which callers must report instead of guessing a launch.
-// --help exits immediately on both generations, so a short timeout means a hung or interactive
-// binary, and that counts as no answer too.
-export function openCodeSupportsStandalone(binary) {
-  if (!binary) return Promise.resolve(null);
-  return new Promise(resolve => {
-    try {
-      execFile(binary, ['--help'], { timeout: 5000 }, (error, stdout, stderr) => {
-        if (error) resolve(null);
-        else resolve(stdout.includes('--standalone') || stderr.includes('--standalone'));
-      });
-    } catch {
-      // execFile can throw synchronously (a .cmd launcher on Windows since CVE-2024-27980);
-      // a probe that cannot ask must still answer, and its answer is "no answer".
-      resolve(null);
-    }
-  });
+// Even a failing or timed-out --help counts as an answer when its output printed the flag; the
+// answer is null only when nothing proved either way.
+export async function openCodeSupportsStandalone(binary) {
+  if (!binary) return null;
+  try {
+    const { stdout, stderr } = await execFileAsync(binary, ['--help'], { timeout: 5000 });
+    return `${stdout}${stderr}`.includes('--standalone');
+  } catch (error) {
+    // A nonzero exit or a killed timeout still delivers everything the binary printed, and the flag
+    // in that output answers the question; a spawn that never ran prints nothing and stays unknown.
+    // The await also catches what execFile throws synchronously (a .cmd launcher on Windows since
+    // CVE-2024-27980): a probe that cannot ask must never reject on its caller.
+    return `${error.stdout}${error.stderr}`.includes('--standalone') ? true : null;
+  }
 }
 
 export function locations(home = homedir(), env = process.env, platform = process.platform) {
@@ -295,8 +296,15 @@ export function launchOptions(id, env = process.env, provider = defaultProvider(
       const selected = `${provider.opencode}/${model}`;
       if (openCodeStandalone === null) {
         // Both generations launch fine without our flag, so the assistant still starts, just on
-        // the user's own model; the warning on stderr says the gateway model was not selected.
-        return { args: [], env: childEnv, note: '(OpenCode version unknown: no model flag added)' };
+        // the user's own model. `warning` is what the launch says on stderr; `apex run` prints it
+        // rather than writing its own version of the same sentence.
+        return {
+          args: [], env: childEnv,
+          note: '(OpenCode interface unknown: no model flag added)',
+          warning: 'Apex CLI: Could not ask which OpenCode interface is installed, so it launches'
+            + ' without a model flag. OpenCode 1 takes --model, OpenCode 2 takes --standalone;'
+            + ' opencode --help says which you have.',
+        };
       }
       if (!openCodeStandalone) return { args: ['--model', selected], env: childEnv };
       // OpenCode 2's interface has no --model, and its shared background service never sees this
@@ -327,8 +335,7 @@ export function launchOptions(id, env = process.env, provider = defaultProvider(
 // The placeholder token is never shown: only the argument list and the launch's note are.
 export function runExpansion(id, provider, installed = {}) {
   const { args, note } = launchOptions(id, { [provider.envVar]: 'placeholder' }, provider, installed);
-  // An unknown OpenCode adds nothing, and a bare `opencode ` would leave its gap to the note alone.
-  return [`${id} ${args.join(' ')}`.trimEnd(), note].filter(Boolean).join('  ');
+  return [[id, ...args].join(' '), note].filter(Boolean).join('  ');
 }
 
 // One line per key: the whole object on one line cannot be folded to a terminal, and a step that
