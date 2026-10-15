@@ -97,16 +97,26 @@ export async function executable(command, env = process.env, platform = process.
   return null;
 }
 
-// OpenCode 1 prints `1.18.34`, OpenCode 2 prints `opencode v2.0.29`, each on a line of its own,
-// so a notice naming another version is not mistaken for it. Anything unreadable is treated as 1,
-// the launch Apex CLI has always used.
-export function openCodeMajor(binary) {
-  if (!binary) return Promise.resolve(1);
+// OpenCode 2's interface has --standalone; OpenCode 1's never had it. Asking the binary which
+// interface it has beats reading its version: dev, beta and source builds of *both* generations
+// report `0.0.0-*` or `local`, so no version regex separates them. OpenCode 1 writes --help to
+// stderr and OpenCode 2 to stdout, so both streams are checked. The answer is true (OpenCode 2),
+// false (OpenCode 1) or null: no answer, which callers must report instead of guessing a launch.
+// --help exits immediately on both generations, so a short timeout means a hung or interactive
+// binary, and that counts as no answer too.
+export function openCodeSupportsStandalone(binary) {
+  if (!binary) return Promise.resolve(null);
   return new Promise(resolve => {
-    execFile(binary, ['--version'], { timeout: 10000 }, (error, stdout) => {
-      const match = !error && /^(?:opencode )?v?(\d+)\.\d+\.\d+\s*$/m.exec(stdout);
-      resolve(match ? Number(match[1]) : 1);
-    });
+    try {
+      execFile(binary, ['--help'], { timeout: 5000 }, (error, stdout, stderr) => {
+        if (error) resolve(null);
+        else resolve(stdout.includes('--standalone') || stderr.includes('--standalone'));
+      });
+    } catch {
+      // execFile can throw synchronously (a .cmd launcher on Windows since CVE-2024-27980);
+      // a probe that cannot ask must still answer, and its answer is "no answer".
+      resolve(null);
+    }
   });
 }
 
@@ -272,14 +282,23 @@ export function launchToken(env, provider) {
   return token;
 }
 
-export function launchOptions(id, env = process.env, provider = defaultProvider(env), { openCode = 1 } = {}) {
+// `openCodeStandalone` is openCodeSupportsStandalone's answer: true launches the OpenCode 2 way,
+// false the OpenCode 1 way, and null — no answer — launches with no model flag at all rather than
+// guessing a generation and dying on a flag it rejects. The default is the launch Apex CLI has
+// always used for a caller that never probed.
+export function launchOptions(id, env = process.env, provider = defaultProvider(env), { openCodeStandalone = false } = {}) {
   const { model } = provider;
   const token = launchToken(env, provider);
   const childEnv = { ...env };
   switch (id) {
     case 'opencode': {
       const selected = `${provider.opencode}/${model}`;
-      if (openCode < 2) return { args: ['--model', selected], env: childEnv };
+      if (openCodeStandalone === null) {
+        // Both generations launch fine without our flag, so the assistant still starts, just on
+        // the user's own model; the warning on stderr says the gateway model was not selected.
+        return { args: [], env: childEnv, note: '(OpenCode version unknown: no model flag added)' };
+      }
+      if (!openCodeStandalone) return { args: ['--model', selected], env: childEnv };
       // OpenCode 2's interface has no --model, and its shared background service never sees this
       // environment. A private server (--standalone) does: it reads the model from inline config,
       // and the gateway key the config references. Its flags only follow a subcommand.
@@ -308,7 +327,8 @@ export function launchOptions(id, env = process.env, provider = defaultProvider(
 // The placeholder token is never shown: only the argument list and the launch's note are.
 export function runExpansion(id, provider, installed = {}) {
   const { args, note } = launchOptions(id, { [provider.envVar]: 'placeholder' }, provider, installed);
-  return [`${id} ${args.join(' ')}`, note].filter(Boolean).join('  ');
+  // An unknown OpenCode adds nothing, and a bare `opencode ` would leave its gap to the note alone.
+  return [`${id} ${args.join(' ')}`.trimEnd(), note].filter(Boolean).join('  ');
 }
 
 // One line per key: the whole object on one line cannot be folded to a terminal, and a step that
