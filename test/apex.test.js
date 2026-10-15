@@ -33,9 +33,9 @@ async function fixture(context) {
   // `npm test` and `npx` set this, and it decides how follow-up commands are spelled.
   delete env.CI;
   delete env.npm_command;
-  // A gateway key in the developer's shell would change the default gateway, and their own
-  // XDG_DATA_HOME would point OpenCode's key store at their real one. Their inline config would
-  // reach a launched OpenCode the same way it reaches their shell.
+  // A gateway key in the developer's shell would change the default gateway, their own
+  // XDG_DATA_HOME would point OpenCode's key store at their real one, and their inline OpenCode
+  // config would reach the fake binaries.
   for (const provider of Object.values(PROVIDERS)) if (provider !== CALLSTACK) delete env[provider.envVar];
   delete env.XDG_DATA_HOME;
   delete env.OPENCODE_CONFIG_CONTENT;
@@ -902,13 +902,12 @@ process.exit(0);
 `;
   await writeFile(join(bin, 'help-stdout'), script('stdout'), { mode: 0o755 });
   await writeFile(join(bin, 'help-stderr'), script('stderr'), { mode: 0o755 });
-  // OpenCode 1 prints its help without --standalone; a v1 dev build is indistinguishable by
-  // --version alone, which is exactly why the probe asks about the flag instead.
+  // OpenCode 1's help has no --standalone.
   await writeFile(join(bin, 'v1-help'), `#!${process.execPath}
 process.stderr.write('Usage: opencode [flags]\\n  --model  model to use\\n');
 process.exit(0);
 `, { mode: 0o755 });
-  // What a wrapper printed before it died is still the answer; a failure that printed nothing is not.
+  // Output from a failing --help still counts; a failure with no output is unknown.
   await writeFile(join(bin, 'exit-3-flag'), `#!${process.execPath}\nprocess.stdout.write('  --standalone\\n');\nprocess.exit(3);\n`, { mode: 0o755 });
   await writeFile(join(bin, 'exit-1-silent'), `#!${process.execPath}\nprocess.exit(1);\n`, { mode: 0o755 });
   const paths = name => join(bin, name);
@@ -919,9 +918,7 @@ process.exit(0);
   assert.equal(await openCodeSupportsStandalone(paths('exit-1-silent')), null, 'a failing --help that printed nothing is no answer');
   assert.equal(await openCodeSupportsStandalone(join(home, 'missing')), null, 'a binary that is not there');
   assert.equal(await openCodeSupportsStandalone(bin), null, 'a directory is not a binary');
-  // execFile rejects outright on some truthy paths (one with a NUL byte; on Windows, any .cmd
-  // launcher since CVE-2024-27980). A probe that cannot ask must answer "no answer", not reject on
-  // the caller. An empty or missing path answers the same way, from the guard that runs first.
+  // execFile throws synchronously on some paths (a NUL byte here, a .cmd on Windows).
   assert.equal(await openCodeSupportsStandalone('a\0b'), null, 'a path execFile throws synchronously on');
   assert.equal(await openCodeSupportsStandalone(''), null, 'no path, no answer');
   assert.equal(await openCodeSupportsStandalone(null), null, 'no binary, no answer');
@@ -931,8 +928,7 @@ test('CLI run picks the model the way the installed OpenCode accepts it', async 
   const { home, env } = await fixture(context);
   const bin = join(home, 'bin');
   await mkdir(bin);
-  // The fake answers the probe from one variable. Apex CLI never reads --version, so the fake
-  // has no --version branch at all: which generation a build is comes only from what --help prints.
+  // The fake's --help output, and so the detected generation, is driven by environment variables.
   await writeFile(join(bin, 'opencode'), `#!${process.execPath}
 if (process.argv[2] === '--help') {
   if (process.env.FAKE_OPENCODE_HELP_FAILS === '1') process.exit(1);
@@ -960,7 +956,7 @@ console.log(JSON.stringify({ args: process.argv.slice(2), inline: process.env.OP
   assert.deepEqual(run(V2, {}, ['mini']).args, ['mini', '--standalone']);
   assert.deepEqual(run(V2, {}, ['auth', 'list']).args, ['auth', 'list'], 'subcommands without --standalone pass through');
   assert.deepEqual(JSON.parse(v2.inline), { theme: 'dark', model: `callstack.ai/${MODEL}` });
-  // A binary that cannot be asked adds no flag rather than guessing a generation and dying on it.
+  // An unknown generation gets neither flag, and a warning.
   const unknown = run({ FAKE_OPENCODE_HELP_FAILS: '1' });
   assert.deepEqual(unknown.args, ['--x'], 'an unanswerable probe launches with neither --model nor --standalone');
   assert.equal(unknown.inline, undefined, 'and the inline config is left alone');
@@ -1247,8 +1243,7 @@ test('the closing block shows what each run command expands to, and when undo is
   const applied = cli([...INIT, '--apply'], env);
   assert.equal(applied.status, 0, applied.stderr);
   assert.match(applied.stdout, at(/^Use these commands to run callstack\/Apex with your selected harnesses:$/));
-  // The fixture has no opencode on PATH, so there is no interface to ask about and the line says
-  // just the command; `apex run opencode` itself is what reports the missing binary.
+  // The fixture has no opencode on PATH, so nothing is probed and the line is the bare command.
   assert.match(applied.stdout, at(/^apex run opencode {2}opencode$/));
   assert.match(applied.stdout, at(/^apex run codex +codex --profile callstack_ai$/));
   assert.match(applied.stdout, at(/^apex run pi +pi --provider callstack --model callstack\/Apex --thinking medium$/));

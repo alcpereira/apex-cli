@@ -379,9 +379,7 @@ async function commandInit(rest) {
     ui.dim('Apex CLI never reads, stores or logs the key itself.'),
   ]);
   const runnable = active.map(entry => entry.id).filter(id => RUNNABLE.includes(id));
-  // Only a probe that ran can answer "unknown interface". An OpenCode that is not on PATH yet has
-  // nothing to ask and `apex run` cannot launch it at all, so its line says just the command;
-  // `apex run opencode` itself is what tells them to install it.
+  // OpenCode not on PATH can't be probed; show the bare command and let `apex run` report it.
   const opencodeBinary = active.find(entry => entry.id === 'opencode')?.binary;
   const probed = opencodeBinary ? await openCodeSupportsStandalone(opencodeBinary) : undefined;
   const installed = { openCodeStandalone: probed };
@@ -575,8 +573,7 @@ async function commandRun(rest) {
     throw new Error('Windows .cmd/.bat launchers are not executed through a shell. Use WSL or launch the configured assistant directly.');
   }
   // OpenCode 1 and 2 take the model in different ways, so the launch depends on which is installed.
-  // An unknown answer adds no flag at all; the launch's own warning says so on stderr, because the
-  // child owns stdout from here on.
+  // The warning goes to stderr because the child owns stdout.
   const standalone = id === 'opencode' ? await openCodeSupportsStandalone(binary) : false;
   const options = launchOptions(id, process.env, provider, { openCodeStandalone: standalone });
   if (options.warning) console.error(styleText('yellow', options.warning));

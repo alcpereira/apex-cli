@@ -100,23 +100,18 @@ export async function executable(command, env = process.env, platform = process.
 
 const execFileAsync = promisify(execFile);
 
-// OpenCode 2's interface has --standalone; OpenCode 1's never had it. Asking the binary which
-// interface it has beats reading its version: dev, beta and source builds of *both* generations
-// report `0.0.0-*` or `local`, so no version regex separates them. OpenCode 1 writes --help to
-// stderr and OpenCode 2 to stdout, so both streams are checked. The answer is true (OpenCode 2),
-// false (OpenCode 1) or null: no answer, which callers must report instead of guessing a launch.
-// Even a failing or timed-out --help counts as an answer when its output printed the flag; the
-// answer is null only when nothing proved either way.
+// Only OpenCode 2 has --standalone, so its --help tells the generations apart. The version can't:
+// dev and beta builds of both report `0.0.0-*` or `local`. OpenCode 1 prints its help on stderr
+// and OpenCode 2 on stdout, so both are checked. Resolves true (OpenCode 2), false (OpenCode 1)
+// or null when the binary gave no usable answer; it never rejects.
 export async function openCodeSupportsStandalone(binary) {
   if (!binary) return null;
   try {
     const { stdout, stderr } = await execFileAsync(binary, ['--help'], { timeout: 5000 });
     return `${stdout}${stderr}`.includes('--standalone');
   } catch (error) {
-    // A nonzero exit or a killed timeout still delivers everything the binary printed, and the flag
-    // in that output answers the question; a spawn that never ran prints nothing and stays unknown.
-    // The await also catches what execFile throws synchronously (a .cmd launcher on Windows since
-    // CVE-2024-27980): a probe that cannot ask must never reject on its caller.
+    // Covers nonzero exits, timeouts, spawn failures and synchronous throws (e.g. a .cmd on
+    // Windows). Output printed before a failure still counts; without the flag it proves nothing.
     return `${error.stdout}${error.stderr}`.includes('--standalone') ? true : null;
   }
 }
@@ -283,10 +278,8 @@ export function launchToken(env, provider) {
   return token;
 }
 
-// `openCodeStandalone` is openCodeSupportsStandalone's answer: true launches the OpenCode 2 way,
-// false the OpenCode 1 way, and null — no answer — launches with no model flag at all rather than
-// guessing a generation and dying on a flag it rejects. The default is the launch Apex CLI has
-// always used for a caller that never probed.
+// `openCodeStandalone` is the result of openCodeSupportsStandalone: true for OpenCode 2, false for
+// OpenCode 1, null when unknown. Unknown adds no model flag, since a wrong one makes OpenCode exit.
 export function launchOptions(id, env = process.env, provider = defaultProvider(env), { openCodeStandalone = false } = {}) {
   const { model } = provider;
   const token = launchToken(env, provider);
@@ -295,9 +288,7 @@ export function launchOptions(id, env = process.env, provider = defaultProvider(
     case 'opencode': {
       const selected = `${provider.opencode}/${model}`;
       if (openCodeStandalone === null) {
-        // Both generations launch fine without our flag, so the assistant still starts, just on
-        // the user's own model. `warning` is what the launch says on stderr; `apex run` prints it
-        // rather than writing its own version of the same sentence.
+        // Both generations start without a model flag, on the user's own configured model.
         return {
           args: [], env: childEnv,
           note: '(OpenCode interface unknown: no model flag added)',
